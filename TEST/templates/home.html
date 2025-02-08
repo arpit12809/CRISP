@@ -57,6 +57,9 @@
                 <div class="hidden md:block">
                     <div class="ml-10 flex items-center space-x-4">
                         <a href="#" class="text-gray-300 hover:text-blue-400 px-3 py-2 rounded-md font-medium">Recent</a>
+                        <button id="intercept-button" class="bg-red-500 text-white px-3 py-2 rounded-md font-medium">
+                            Intercept off
+                        </button>
                     </div>
                 </div>
             </div>
@@ -97,5 +100,25 @@
             </div>
         </div>
     </footer>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            const interceptButton = document.getElementById("intercept-button");
+            let interceptOn = false;
+            
+            interceptButton.addEventListener("click", function() {
+                interceptOn = !interceptOn;
+                if (interceptOn) {
+                    interceptButton.textContent = "Intercept on";
+                    interceptButton.classList.remove("bg-red-500");
+                    interceptButton.classList.add("bg-green-500");
+                } else {
+                    interceptButton.textContent = "Intercept off";
+                    interceptButton.classList.remove("bg-green-500");
+                    interceptButton.classList.add("bg-red-500");
+                }
+            });
+        });
+    </script>
 </body>
 </html>
