@@ -5,6 +5,8 @@ import signal
 import sys
 import time
 
+INTERCEPT_ENABLED = True
+
 def setup_database():
     database = sqlite3.connect('Captured_requests.db')
     cursor = database.cursor()
@@ -15,53 +17,83 @@ def setup_database():
     cursor.execute('create table all_requests (Request_Number float, Request text, Response text)')
     database.close()
 
+def intercept_request(request):
+    """Intercepts the request and waits for user decision"""
+    print("\n=== Intercepted HTTP Request ===")
+    print(request.decode('utf-8', errors='replace'))
+    
+    while True:
+        command = input("Enter 'forward' to send request or 'drop' to discard: ").strip().lower()
+        if command == 'forward':
+            return True
+        elif command == 'drop':
+            return False
+        else:
+            print("Invalid command. Please enter 'forward' or 'drop'.")
 
 def handle_client_request(client_socket):
     database = sqlite3.connect('Captured_requests.db')
     cursor = database.cursor()
 
-    print("Received request:\n")
     request = b''
     client_socket.setblocking(False)
     while True:
         try:
             data = client_socket.recv(2*1024)
-            request = request + data
-            print(f"{data.decode('utf-8')}")
+            request += data
+            print(f"{data.decode('utf-8', errors='replace')}")
         except:
             break
+
+    if INTERCEPT_ENABLED:
+        print("\n[!] Request interception required!")
+        if not intercept_request(request):
+            print("[!] Request dropped by user")
+            client_socket.close()
+            cursor.close()
+            database.close()
+            return
+
+    # Rest of the original forwarding logic
     host, port = extract_host_port_from_request(request)
     destination_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    destination_socket.connect((host, port))
-    destination_socket.sendall(request)
-    print("Received response:\n")
-    response = bytes()
-    destination_socket.settimeout(10.0)
-    while True:
-        try:
-            data = destination_socket.recv(2*1024)
-            response += data
-            if len(data) > 0:
-                client_socket.sendall(data)
-            else:
+    
+    try:
+        destination_socket.connect((host, port))
+        destination_socket.sendall(request)
+        
+        print("Received response:\n")
+        response = bytes()
+        destination_socket.settimeout(10.0)
+        
+        while True:
+            try:
+                data = destination_socket.recv(2*1024)
+                response += data
+                if len(data) > 0:
+                    client_socket.sendall(data)
+                else:
+                    break
+            except (TimeoutError, KeyboardInterrupt):
                 break
-        except KeyboardInterrupt:
-            destination_socket.close()
-            client_socket.close()
-        except TimeoutError:
-            break
-    print(response.decode())
-    cursor.execute('insert into all_requests values (?,?,?)', (time.time(), request.decode(), response.decode()))
-    destination_socket.close()
-    client_socket.close()
-    print('<--------------------------------------------------------------------------------------->')
-    print('The database is:')
-    for row in cursor.execute('select * from all_requests order by Request_Number desc'):
-        print(row)
-    print('<--------------------------------------------------------------------------------------->')
-    cursor.close()
-    database.commit()
-    database.close()
+
+        print(response.decode('utf-8', errors='replace'))
+        cursor.execute('insert into all_requests values (?,?,?)', 
+                      (time.time(), request.decode('utf-8', errors='replace'), 
+                       response.decode('utf-8', errors='replace')))
+                       
+    finally:
+        destination_socket.close()
+        client_socket.close()
+        print('<--------------------------------------------------------------------------------------->')
+        print('The database is:')
+        for row in cursor.execute('select * from all_requests order by Request_Number desc'):
+            print(row)
+        print('<--------------------------------------------------------------------------------------->')
+        cursor.close()
+        database.commit()
+        database.close()
+
 
 def extract_host_port_from_request(request):
     host_string_start = request.find(b'Host: ') + len(b'Host: ')
