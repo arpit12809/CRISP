@@ -4,8 +4,67 @@ import sqlite3
 import signal
 import sys
 import time
+import json
+from websockets.server import serve
+import asyncio
+import queue
 
-INTERCEPT_ENABLED = True
+intercept_queue = queue.Queue()
+is_intercepting = False
+connected_clients = set()
+
+async def websocket_handler(websocket):
+    """Handle WebSocket connections from the UI"""
+    global connected_clients
+    connected_clients.add(websocket)
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            command = data.get('command')
+            
+            if command == 'toggle_intercept':
+                global is_intercepting
+                is_intercepting = data.get('enabled', False)
+            elif command == 'forward':
+                if not intercept_queue.empty():
+                    intercept_data = intercept_queue.get()
+                    intercept_data['action'] = 'forward'
+                    await process_intercepted_request(intercept_data)
+            elif command == 'drop':
+                if not intercept_queue.empty():
+                    intercept_queue.get()
+    finally:
+        connected_clients.remove(websocket)
+
+async def notify_ui(request_data):
+    """Send intercepted request to UI"""
+    if connected_clients:
+        message = json.dumps({
+            'type': 'intercepted_request',
+            'data': request_data
+        })
+        await asyncio.gather(
+            *[client.send(message) for client in connected_clients]
+        )
+
+async def process_intercepted_request(intercept_data):
+    """Process an intercepted request based on UI action"""
+    if intercept_data.get('action') == 'forward':
+        client_socket = intercept_data['client_socket']
+        request = intercept_data['request']
+        try:
+            host, port = extract_host_port_from_request(request)
+            destination_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            destination_socket.connect((host, port))
+            destination_socket.sendall(request)
+            response = handle_response(destination_socket, client_socket)
+            store_request_response(request, response)
+            
+            destination_socket.close()
+        except Exception as e:
+            print(f"Error processing request: {e}")
+        finally:
+            client_socket.close()
 
 def setup_database():
     database = sqlite3.connect('Captured_requests.db')
@@ -17,83 +76,59 @@ def setup_database():
     cursor.execute('create table all_requests (Request_Number float, Request text, Response text)')
     database.close()
 
-def intercept_request(request):
-    """Intercepts the request and waits for user decision"""
-    print("\n=== Intercepted HTTP Request ===")
-    print(request.decode('utf-8', errors='replace'))
-    
-    while True:
-        command = input("Enter 'forward' to send request or 'drop' to discard: ").strip().lower()
-        if command == 'forward':
-            return True
-        elif command == 'drop':
-            return False
-        else:
-            print("Invalid command. Please enter 'forward' or 'drop'.")
-
-def handle_client_request(client_socket):
+def store_request_response(request, response):
     database = sqlite3.connect('Captured_requests.db')
     cursor = database.cursor()
+    cursor.execute('insert into all_requests values (?,?,?)', 
+                  (time.time(), request.decode(), response.decode()))
+    database.commit()
+    database.close()
 
+def handle_response(destination_socket, client_socket):
+    response = bytes()
+    destination_socket.settimeout(10.0)
+    while True:
+        try:
+            data = destination_socket.recv(2*1024)
+            response += data
+            if len(data) > 0:
+                client_socket.sendall(data)
+            else:
+                break
+        except (socket.timeout, TimeoutError):
+            break
+    return response
+
+def handle_client_request(client_socket):
+    print("Received request:")
     request = b''
     client_socket.setblocking(False)
+    
     while True:
         try:
             data = client_socket.recv(2*1024)
-            request += data
-            print(f"{data.decode('utf-8', errors='replace')}")
+            request = request + data
+            print(f"{data.decode('utf-8')}")
         except:
             break
-
-    if INTERCEPT_ENABLED:
-        print("\n[!] Request interception required!")
-        if not intercept_request(request):
-            print("[!] Request dropped by user")
-            client_socket.close()
-            cursor.close()
-            database.close()
-            return
-
-    # Rest of the original forwarding logic
-    host, port = extract_host_port_from_request(request)
-    destination_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
-    try:
-        destination_socket.connect((host, port))
-        destination_socket.sendall(request)
-        
-        print("Received response:\n")
-        response = bytes()
-        destination_socket.settimeout(10.0)
-        
-        while True:
-            try:
-                data = destination_socket.recv(2*1024)
-                response += data
-                if len(data) > 0:
-                    client_socket.sendall(data)
-                else:
-                    break
-            except (TimeoutError, KeyboardInterrupt):
-                break
-
-        print(response.decode('utf-8', errors='replace'))
-        cursor.execute('insert into all_requests values (?,?,?)', 
-                      (time.time(), request.decode('utf-8', errors='replace'), 
-                       response.decode('utf-8', errors='replace')))
-                       
-    finally:
-        destination_socket.close()
-        client_socket.close()
-        print('<--------------------------------------------------------------------------------------->')
-        print('The database is:')
-        for row in cursor.execute('select * from all_requests order by Request_Number desc'):
-            print(row)
-        print('<--------------------------------------------------------------------------------------->')
-        cursor.close()
-        database.commit()
-        database.close()
-
+    if is_intercepting:
+        intercept_data = {
+            'client_socket': client_socket,
+            'request': request,
+            'timestamp': time.time()
+        }
+        intercept_queue.put(intercept_data)
+        asyncio.run(notify_ui({
+            'request': request.decode(),
+            'timestamp': time.time()
+        }))
+    else:
+        asyncio.run(process_intercepted_request({
+            'action': 'forward',
+            'client_socket': client_socket,
+            'request': request
+        }))
 
 def extract_host_port_from_request(request):
     host_string_start = request.find(b'Host: ') + len(b'Host: ')
@@ -111,9 +146,11 @@ def extract_host_port_from_request(request):
         host = host_string[:port_pos]
     return host, port
 
+async def start_websocket_server():
+    async with serve(websocket_handler, "localhost", 8889):
+        await asyncio.Future()
+
 def start_proxy_server():
-    signal.signal(signal.SIGINT, shutdown_server)
-    global server, request_index
     setup_database()
     port = 8888
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -121,16 +158,24 @@ def start_proxy_server():
     server.bind(('127.0.0.1', port))
     server.listen(20)
     print(f"Proxy server listening on port {port}...")
+    
     while True:
-        client_socket, addr = server.accept()
-        print(f"Accepted connection from {addr[0]}:{addr[1]}")
-        client_handler = threading.Thread(target=handle_client_request, args=(client_socket,))
-        client_handler.start()
-
-def shutdown_server(signal, frame):
-    print('Shutting down server...')
-    server.close()
-    sys.exit(0)
+        try:
+            client_socket, addr = server.accept()
+            print(f"Accepted connection from {addr[0]}:{addr[1]}")
+            client_handler = threading.Thread(
+                target=handle_client_request,
+                args=(client_socket,)
+            )
+            client_handler.start()
+        except KeyboardInterrupt:
+            print("Shutting down server...")
+            server.close()
+            sys.exit(0)
 
 if __name__ == "__main__":
+    websocket_thread = threading.Thread(
+        target=lambda: asyncio.run(start_websocket_server())
+    )
+    websocket_thread.start()
     start_proxy_server()
